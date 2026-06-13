@@ -1,0 +1,14 @@
+[
+  {
+    "date": "2026-06-12",
+    "amount": 277.0,
+    "category": "Food",
+    "merchant": "Swiggy"
+  },
+  {
+    "date": "2026-06-12",
+    "amount": 2000.0,
+    "category": "Health",
+    "merchant": "Unknown"
+  }
+]
