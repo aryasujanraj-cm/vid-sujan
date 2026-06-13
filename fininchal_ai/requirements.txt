@@ -6,3 +6,4 @@ plotly
 fpdf2
 google-generativeai
 PyPDF2
+requests
