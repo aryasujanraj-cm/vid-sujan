@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -7,7 +8,7 @@ import streamlit as st
 
 from advice import give_advice
 from analysis import analyze, detect_anomalies, monthly_trend, spending_insights, top_category
-from book_advisor import show_book_advisor
+from book_advisor import extract_book_text, get_book_advice, identify_book
 from budget import budget_analysis as rule_budget_analysis
 from categorize import KEYWORDS, categorize
 from export import generate_pdf_report
@@ -86,16 +87,8 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0f172a,#080c
 </style>
 """, unsafe_allow_html=True)
 
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "username" not in st.session_state:
-    st.session_state.username = "default"
 if "page" not in st.session_state:
     st.session_state.page = "🏠 Home"
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "gemini_api_key" not in st.session_state:
-    st.session_state.gemini_api_key = ""
 
 MENU_LIST = [
     "🏠 Home",
@@ -309,7 +302,7 @@ def upload_screenshot():
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        st.image(file, caption="Uploaded", use_container_width=True)
+        st.image(file, caption="Uploaded", use_column_width=True)
     with col2:
         with st.spinner("🔍 Reading receipt..."):
             file.seek(0)
@@ -549,7 +542,34 @@ def what_if_page():
 
 def book_advisor_page():
     render_page_header("📚 Book Advisor", "Apply financial books to your real spending")
-    show_book_advisor()
+    pdf_file = st.file_uploader("Upload a financial book PDF", type=["pdf"])
+    if not pdf_file:
+        return
+    with st.spinner("Extracting first 10 pages..."):
+        book_text = extract_book_text(pdf_file)
+    book_name = identify_book(book_text)
+    card(f"<b>{book_name}</b>", "feature")
+    if not book_text:
+        card("Could not extract text. Make sure the PDF has selectable text.", "warning")
+        return
+    expenses = load_expenses(username())
+    total, _category_data, top, breakdown = spending_context(expenses)
+    summary = f"total {money(total)}, top category {top}, breakdown {breakdown}"
+    with st.spinner("Generating book advice..."):
+        advice = get_book_advice(book_text, summary)
+    tips = [line.strip() for line in advice.splitlines() if line.strip()]
+    for tip in tips:
+        card(tip, "advice")
+    with st.expander("Extracted text preview"):
+        st.write(book_text[:2000])
+    if st.button("Save these tips to Guru", use_container_width=True):
+        try:
+            with open(guru_path(username()), "a", encoding="utf-8") as f:
+                for tip in tips:
+                    f.write(re.sub(r"^\d+[\).]\s*", "", tip) + "\n")
+            st.success("Saved tips to your Guru file.")
+        except OSError as exc:
+            st.error(f"Could not save tips: {exc}")
 
 
 def personality_page():
@@ -598,65 +618,94 @@ def indian_finance_page():
 
 
 def guru_chat():
-    st.subheader("🧙 Guru AI – Your Financial Advisor")
+    render_page_header("🤖 Guru AI Chat", "Ask questions with your actual spending as context")
+    st.markdown("<div class='warning-card'>Educational only, not certified financial advice</div>", unsafe_allow_html=True)
 
-    import google.generativeai as genai
-
-    key = st.secrets.get("GEMINI_API_KEY", "")
-    if not key:
-        st.error("GEMINI_API_KEY not found in secrets")
+    # ── Groq setup ──────────────────────────────────────────────────────────
+    groq_key = st.secrets.get("GROQ_API_KEY", "")
+    if not groq_key:
+        st.markdown("<div class='danger-card'>⚠️ GROQ_API_KEY not found in Streamlit secrets.</div>", unsafe_allow_html=True)
+        st.markdown("""
+        **How to fix:**
+        1. Go to [console.groq.com](https://console.groq.com) → sign in with Google
+        2. Click **API Keys → Create API Key**
+        3. Copy the key (starts with `gsk_...`)
+        4. Go to Streamlit Cloud → your app → **Settings → Secrets**
+        5. Add: `GROQ_API_KEY = "gsk_..."`
+        6. Click Save → Reboot app
+        """)
         return
 
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    # ── spending context ─────────────────────────────────────────────────────
+    expenses = load_expenses(username())
+    total, _category_data, top, breakdown = spending_context(expenses)
+    system_prompt = (
+        "You are Guru, a friendly and knowledgeable Indian personal finance advisor. "
+        "Give practical advice tailored to Indian users: SIP investments, PPF, ELSS, "
+        "NPS, tax-saving under 80C, UPI budgeting, and managing EMIs. "
+        "Keep answers concise, warm, and use simple language. "
+        "Always remind users you are an AI and not a SEBI-registered advisor. "
+        f"User spending context: total spend ₹{total:,.2f}, top category {top}, "
+        f"category breakdown: {breakdown}."
+    )
 
-    if "guru_messages" not in st.session_state:
-        st.session_state.guru_messages = []
+    # ── chat history ─────────────────────────────────────────────────────────
+    st.session_state.setdefault("chat_history", [])
 
-    for msg in st.session_state.guru_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    bubbles = ["<div class='chat-container'>"]
+    for message in st.session_state["chat_history"]:
+        cls = "user-bubble" if message["role"] == "user" else "ai-bubble"
+        bubbles.append(f"<div class='{cls}'>{message['content']}</div>")
+    bubbles.append("</div>")
+    st.markdown("".join(bubbles), unsafe_allow_html=True)
 
-    user_input = st.chat_input("Ask Guru about money, savings, investments...")
-    if user_input:
-        st.session_state.guru_messages.append(
-            {"role": "user", "content": user_input}
-        )
-        with st.chat_message("user"):
-            st.markdown(user_input)
+    with st.form("guru_chat_form", clear_on_submit=True):
+        prompt = st.text_input("Ask your financial guru")
+        sent = st.form_submit_button("Send", use_container_width=True)
 
-        history = [
-            {
-                "role": "user",
-                "parts": [
-                    "You are Guru, a friendly Indian personal finance advisor. "
-                    "Give practical advice for Indian users about SIP, PPF, ELSS, "
-                    "NPS, 80C tax saving, UPI budgeting and EMI management. "
-                    "Be concise and warm. Remind users you are an AI not a SEBI advisor."
-                ]
-            },
-            {
-                "role": "model",
-                "parts": ["Understood! I am Guru, your Indian finance advisor. How can I help?"]
-            }
-        ]
+    if not sent or not prompt:
+        return
 
-        for msg in st.session_state.guru_messages[:-1]:
-            role = "model" if msg["role"] == "assistant" else "user"
-            history.append({"role": role, "parts": [msg["content"]]})
+    st.session_state["chat_history"].append({"role": "user", "content": prompt})
 
-        try:
-            chat = model.start_chat(history=history)
-            response = chat.send_message(user_input)
-            reply = response.text
-        except Exception as e:
-            reply = f"Error: {e}"
+    # ── call Groq ─────────────────────────────────────────────────────────────
+    try:
+        import requests
+        headers = {
+            "Authorization": f"Bearer {groq_key}",
+            "Content-Type": "application/json",
+        }
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in st.session_state["chat_history"]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
 
-        st.session_state.guru_messages.append(
-            {"role": "assistant", "content": reply}
-        )
-        with st.chat_message("assistant"):
-            st.markdown(reply)
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": messages,
+            "max_tokens": 700,
+            "temperature": 0.7,
+        }
+        with st.spinner("Asking Guru AI..."):
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            data = resp.json()
+
+        if "choices" in data:
+            response = data["choices"][0]["message"]["content"]
+        elif "error" in data:
+            response = f"❌ Groq error: {data['error'].get('message', str(data['error']))}"
+        else:
+            response = f"❌ Unexpected response: {data}"
+
+    except Exception as exc:
+        response = f"❌ Error: {exc}"
+
+    st.session_state["chat_history"].append({"role": "assistant", "content": response})
+    st.rerun()
 
 
 def splitwise_page():
