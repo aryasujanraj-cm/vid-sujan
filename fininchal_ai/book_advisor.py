@@ -1,68 +1,88 @@
+# book_advisor.py — uses Google Gemini API
+# Functions: extract_book_text, get_book_advice, identify_book, show_book_advisor
+
 import streamlit as st
 import google.generativeai as genai
 import os
+
 try:
     import PyPDF2
 except ImportError:
     PyPDF2 = None
 
 
-def show_book_advisor():
-    st.subheader("📚 Book Advisor – Get AI Insights from Finance Books")
-
-    key = st.secrets.get("GEMINI_API_KEY", "")
+def _get_model():
+    key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
     if not key:
-        st.error("GEMINI_API_KEY not found in secrets")
-        return
-
+        return None
     genai.configure(api_key=key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    return genai.GenerativeModel("gemini-2.0-flash")
 
-    uploaded_file = st.file_uploader(
-        "Upload a finance book PDF",
-        type=["pdf"]
-    )
 
-    if not uploaded_file:
-        st.info("Upload a PDF to get started")
-        return
-
-    cache_key = f"book_{uploaded_file.name}"
-    if cache_key not in st.session_state:
+def extract_book_text(uploaded_file) -> str:
+    """Extract plain text from an uploaded PDF file."""
+    if PyPDF2 is None:
+        return ""
+    try:
         uploaded_file.seek(0)
         reader = PyPDF2.PdfReader(uploaded_file)
-        pages = [p.extract_text() for p in reader.pages if p.extract_text()]
-        st.session_state[cache_key] = "\n".join(pages)
+        pages = []
+        for page in reader.pages[:10]:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        return "\n".join(pages)
+    except Exception:
+        return ""
 
-    book_text = st.session_state[cache_key]
+
+def identify_book(book_text: str) -> str:
+    """Try to identify the book title from extracted text."""
+    if not book_text:
+        return "Unknown Book"
+    snippet = book_text[:500].lower()
+    known_books = {
+        "rich dad": "Rich Dad Poor Dad",
+        "intelligent investor": "The Intelligent Investor",
+        "psychology of money": "The Psychology of Money",
+        "think and grow rich": "Think and Grow Rich",
+        "atomic habits": "Atomic Habits",
+        "zero to one": "Zero to One",
+        "one up on wall street": "One Up on Wall Street",
+        "millionaire next door": "The Millionaire Next Door",
+        "your money or your life": "Your Money or Your Life",
+        "i will teach you to be rich": "I Will Teach You to Be Rich",
+    }
+    for keyword, title in known_books.items():
+        if keyword in snippet:
+            return title
+    return "Finance Book (uploaded)"
+
+
+def get_book_advice(book_text: str, spending_summary: str) -> str:
+    """Get Gemini AI advice based on book content and user spending."""
+    model = _get_model()
+    if model is None:
+        return "⚠️ GEMINI_API_KEY not set. Add it in Streamlit Cloud → Settings → Secrets."
+
     words = book_text.split()
     if len(words) > 12000:
         book_text = " ".join(words[:12000])
 
-    st.success(f"Loaded {uploaded_file.name}")
+    prompt = (
+        "You are Guru, an expert Indian personal finance advisor. "
+        "A user has uploaded a finance book. Based on the book content below, "
+        "give 5 practical tips tailored to this user's spending habits. "
+        "Make advice specific to Indian context (SIP, PPF, EMI, UPI, 80C) where relevant.\n\n"
+        f"USER SPENDING: {spending_summary}\n\n"
+        f"BOOK CONTENT:\n{book_text}\n\n"
+        "Give exactly 5 numbered tips. Be concise and actionable."
+    )
 
-    col1, col2, col3 = st.columns(3)
-    quick = None
-    if col1.button("📝 Summarise"):
-        quick = "Give key financial lessons from this book"
-    if col2.button("💡 Top 5 Tips"):
-        quick = "List top 5 actionable money tips for Indian readers"
-    if col3.button("🇮🇳 India Relevance"):
-        quick = "Which concepts apply to Indian investors like SIP PPF tax saving"
-
-    question = st.text_input("Ask a custom question about the book")
-    if st.button("Ask Guru 🧙"):
-        quick = question
-
-    if quick:
-        prompt = (
-            f"You are Guru, an Indian finance advisor.\n\n"
-            f"BOOK CONTENT:\n{book_text}\n\n"
-            f"QUESTION:\n{quick}"
-        )
-        with st.spinner("Guru is thinking..."):
-            try:
-                response = model.generate_content(prompt)
-                st.markdown(response.text)
-            except Exception as e:
-                st.error(f"Error: {e}")
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        if "429" in str(e):
+            return "⏳ Gemini quota reached. Please wait a few minutes and try again."
+        return f"❌ Error: {e}"
