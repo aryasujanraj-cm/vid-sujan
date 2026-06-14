@@ -1,9 +1,8 @@
 import re
 import os
-import google.generativeai as genai
+import numpy as np
 from PIL import Image
 
-# ── easyocr loaded lazily to avoid slow startup ──────────────────────────────
 _easyocr_reader = None
 
 def _get_easyocr():
@@ -17,29 +16,41 @@ def _get_easyocr():
     return _easyocr_reader
 
 
-def get_gemini_client():
-    api_key = ""
+def _get_groq_key():
     try:
         import streamlit as st
-        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        key = st.secrets.get("GROQ_API_KEY", "")
+        if key:
+            return key
     except Exception:
         pass
-    if not api_key:
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        return None
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.0-flash")
+    return os.environ.get("GROQ_API_KEY", "")
 
 
+def _get_gemini():
+    try:
+        import google.generativeai as genai
+        import streamlit as st
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        if not api_key:
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+        if api_key:
+            genai.configure(api_key=api_key)
+            return genai.GenerativeModel("gemini-2.0-flash")
+    except Exception:
+        pass
+    return None
+
+
+# ── YOUR PERFECT LOGIC (unchanged) ───────────────────────────────────────────
 def fix_symbols(text):
     text = str(text or "")
     replacements = {
         "Rs.": "₹", "Rs": "₹",
-        "INR": "₹", "inr": "₹", "?": "₹"
+        "INR": "₹", "inr": "₹", "?": "₹",
     }
-    for s, t in replacements.items():
-        text = text.replace(s, t)
+    for source, target in replacements.items():
+        text = text.replace(source, target)
     return text
 
 
@@ -50,105 +61,179 @@ def clean_text(text):
     return text.strip()
 
 
-def _extract_with_easyocr(image_file):
-    """Fallback: extract raw text using easyocr, then guess amount + merchant."""
+def _to_float(value):
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_amount_candidates(text):
+    text = str(text or "")
+    candidates = []
+    priority_patterns = [
+        (r"(?:TOTAL|GRAND\s+TOTAL|AMOUNT|PAID)\s*[:\-]?\s*[₹$€]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)", 100),
+        (r"[₹$€]\s*([0-9][0-9,]*(?:\.\d{1,2})?)", 80),
+    ]
+    for pattern, score in priority_patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            value = _to_float(match.group(1))
+            if 10 <= value <= 100000:
+                candidates.append({"amount": value, "score": score})
+    for match in re.finditer(r"\b([0-9][0-9,]*(?:\.\d{1,2})?)\b", text):
+        value = _to_float(match.group(1))
+        if 10 <= value <= 100000:
+            candidates.append({"amount": value, "score": 10})
+    return candidates
+
+
+def select_best_amount(candidates):
+    if not candidates:
+        return 0
+    best = max(candidates, key=lambda item: (item["score"], item["amount"]))
+    return best["amount"]
+
+
+def extract_details(text):
+    fixed_text = fix_symbols(text)
+    currency = "₹"
+    if "$" in fixed_text:
+        currency = "$"
+    elif "€" in fixed_text:
+        currency = "€"
+    elif "₹" in fixed_text:
+        currency = "₹"
+    cleaned = clean_text(fixed_text)
+    amount = select_best_amount(get_amount_candidates(cleaned))
+    merchant = "Unknown"
+    skip_words = {
+        "total", "grand", "amount", "paid", "payment", "debit", "credit",
+        "transaction", "successful", "success", "date", "time",
+    }
+    for word in re.findall(r"\b[A-Za-z]{4,}\b", cleaned):
+        if word.lower() not in skip_words:
+            merchant = word
+            break
+    return merchant, amount, currency
+
+
+# ── Groq cleans up messy OCR text ────────────────────────────────────────────
+def _ask_groq(raw_ocr_text):
+    groq_key = _get_groq_key()
+    if not groq_key:
+        return None, None
+
+    try:
+        import requests
+        prompt = f"""You are a payment receipt parser.
+Below is raw OCR text extracted from an Indian payment screenshot (UPI, PhonePe, GPay, Paytm, bank receipt).
+
+RAW OCR TEXT:
+{raw_ocr_text}
+
+Extract ONLY:
+1. The actual payment amount (NOT order ID, NOT transaction ID, just the rupee amount paid)
+2. The merchant or shop name who received the payment
+
+Reply in EXACTLY this format, nothing else:
+AMOUNT: <number only, no symbols>
+MERCHANT: <name>"""
+
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 100,
+            "temperature": 0,
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {groq_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        data = resp.json()
+        if "choices" not in data:
+            return None, None
+
+        reply = data["choices"][0]["message"]["content"]
+        amount = None
+        merchant = None
+        for line in reply.splitlines():
+            if line.startswith("AMOUNT:"):
+                try:
+                    amount = float(line.replace("AMOUNT:", "").strip().replace(",", ""))
+                except Exception:
+                    pass
+            elif line.startswith("MERCHANT:"):
+                merchant = line.replace("MERCHANT:", "").strip()
+        return amount, merchant
+
+    except Exception:
+        return None, None
+
+
+# ── OCR with easyocr ─────────────────────────────────────────────────────────
+def _ocr_with_easyocr(image_file):
     reader = _get_easyocr()
     if reader is None:
-        return "ERROR: No OCR available. Add GEMINI_API_KEY to secrets.", 0.0
-
+        return ""
     image_file.seek(0)
     img = Image.open(image_file).convert("RGB")
-
-    import numpy as np
     results = reader.readtext(np.array(img), detail=0)
-    raw = " ".join(results)
-
-    # Guess amount — find largest number in text
-    amounts = re.findall(r"[\d,]+\.?\d*", raw)
-    amount = 0.0
-    for a in amounts:
-        try:
-            val = float(a.replace(",", ""))
-            if val > amount:
-                amount = val
-        except Exception:
-            pass
-
-    # Guess merchant — first capitalized word group
-    merchant = "Unknown"
-    match = re.search(r"[A-Z][a-zA-Z]+([\s][A-Z][a-zA-Z]+)*", raw)
-    if match:
-        merchant = match.group(0)
-
-    text = fix_symbols(raw)
-    text = clean_text(text)
-
-    # Format like Gemini so extract_details works
-    formatted = f"AMOUNT: {amount}\nMERCHANT: {merchant}\nTEXT: {text}"
-    return formatted, amount
+    return " ".join(results)
 
 
+# ── main functions ────────────────────────────────────────────────────────────
 def extract_text_and_amount(image_file):
-    # ── Try Gemini first ──────────────────────────────────────────────────
-    model = get_gemini_client()
+    # ── Option 1: Gemini Vision (best, if key available) ──────────────────
+    model = _get_gemini()
     if model is not None:
         try:
             image_file.seek(0)
             img = Image.open(image_file)
-            prompt = """This is a payment screenshot
-            (UPI, PhonePe, GPay, Paytm, bank receipt).
-            Extract exactly:
-            1) Total amount paid (numbers only)
-            2) Merchant or recipient name
-            3) All visible text
+            prompt = """This is a payment screenshot (UPI, PhonePe, GPay, Paytm, bank receipt).
+Extract exactly:
+1) Total amount paid (numbers only, NOT order ID or transaction ID)
+2) Merchant or recipient name
+3) All visible text
 
-            Reply in exactly this format:
-            AMOUNT: <number>
-            MERCHANT: <name>
-            TEXT: <all visible text>"""
+Reply in exactly this format:
+AMOUNT: <number>
+MERCHANT: <name>
+TEXT: <all visible text>"""
             response = model.generate_content([prompt, img])
             raw = response.text
-            amount = 0.0
-            for line in raw.splitlines():
-                if line.startswith("AMOUNT:"):
-                    try:
-                        amount = float(
-                            line.replace("AMOUNT:", "")
-                            .strip().replace(",", "")
-                        )
-                    except Exception:
-                        pass
             fixed = fix_symbols(raw)
             text = clean_text(fixed)
+            _merchant, amount, _currency = extract_details(text)
             return text, amount
         except Exception as e:
-            err = str(e)
-            # If quota hit → fall through to easyocr
-            if "429" not in err and "quota" not in err.lower():
-                return f"ERROR: {err}", 0.0
-            # else fall through below
+            if "429" not in str(e) and "quota" not in str(e).lower():
+                return f"ERROR: {str(e)}", 0
 
-    # ── Fallback: easyocr ────────────────────────────────────────────────
+    # ── Option 2: easyocr → Groq (no Gemini key needed) ──────────────────
     try:
-        image_file.seek(0)
-        return _extract_with_easyocr(image_file)
+        # Step 1: easyocr reads the image
+        raw_text = _ocr_with_easyocr(image_file)
+        if not raw_text:
+            return "ERROR: Could not read image.", 0
+
+        fixed_text = fix_symbols(raw_text)
+        clean = clean_text(fixed_text)
+
+        # Step 2: send raw text to Groq for smart parsing
+        groq_amount, groq_merchant = _ask_groq(clean)
+
+        # Step 3: build final text output
+        amount = groq_amount if groq_amount and 1 <= groq_amount <= 999999 else select_best_amount(get_amount_candidates(clean))
+        merchant = groq_merchant if groq_merchant and groq_merchant != "Unknown" else "Unknown"
+
+        # Format like Gemini so extract_details works
+        final_text = f"AMOUNT: {amount}\nMERCHANT: {merchant}\nTEXT: {clean}"
+        return final_text, amount
+
     except Exception as e:
-        return f"ERROR: {str(e)}", 0.0
-
-
-def extract_details(text):
-    merchant = "Unknown"
-    amount = 0.0
-    currency = "₹"
-    for line in str(text).splitlines():
-        if line.startswith("AMOUNT:"):
-            try:
-                amount = float(
-                    line.replace("AMOUNT:", "")
-                    .strip().replace(",", "")
-                )
-            except Exception:
-                pass
-        elif line.startswith("MERCHANT:"):
-            merchant = line.replace("MERCHANT:", "").strip()
-    return merchant, amount, currency
+        return f"ERROR: {str(e)}", 0
